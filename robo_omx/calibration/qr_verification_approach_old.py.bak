@@ -1,0 +1,475 @@
+#!/usr/bin/env python3
+"""
+qr_verification_approach.py
+
+キャリブレーション精度確認用スクリプト:
+- キャリブレーション時(calibrate_hand_eye.py)と100%同一のカラーカメラPnPパイプラインを使用
+- calibration_result.json に記録された正確な marker_size_m (5.7cm等) を自動ロード
+- 手先(end_effector_link)がマーカー直上に正確に位置するよう高精度にIKを求解
+"""
+
+import argparse
+import json
+import math
+import os
+import sys
+import time
+
+import cv2
+from cv_bridge import CvBridge
+import numpy as np
+import rclpy
+from rclpy.action import ActionClient
+from rclpy.node import Node
+from sensor_msgs.msg import CameraInfo, Image, JointState
+from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
+import tf2_ros
+
+
+# ---------------------------------------------------------
+# ロボット運動学 (OpenMANIPULATOR-X 順運動学 & 逆運動学)
+# ---------------------------------------------------------
+def rot_z(q):
+    c, s = np.cos(q), np.sin(q)
+    return np.array([[c, -s, 0, 0], [s, c, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]])
+
+def rot_y(q):
+    c, s = np.cos(q), np.sin(q)
+    return np.array([[c, 0, s, 0], [0, 1, 0, 0], [-s, 0, c, 0], [0, 0, 0, 1]])
+
+def trans(x, y, z):
+    T = np.eye(4)
+    T[0, 3] = x
+    T[1, 3] = y
+    T[2, 3] = z
+    return T
+
+def omx_fk(q):
+    """
+    OpenMANIPULATOR-X 順運動学 (world/link1 -> end_effector_link)
+    """
+    q1, q2, q3, q4 = q
+    T = (
+        trans(0.012, 0.0, 0.0)
+        @ rot_z(q1)
+        @ trans(0.0, 0.0, 0.0595)
+        @ rot_y(q2)
+        @ trans(0.024, 0.0, 0.128)
+        @ rot_y(q3)
+        @ trans(0.124, 0.0, 0.0)
+        @ rot_y(q4)
+        @ trans(0.126, 0.0, 0.0)
+    )
+    return T
+
+def solve_omx_ik(target_pos, q_init=None, max_iter=300, tol=1e-4):
+    """
+    目標位置 (X, Y, Z) にエンドエフェクタ先端を正確に合わせる数値IK (DLS法)
+    位置誤差 (pos error) の最小化を最優先し、手先ピッチ角は可能な範囲で下向きにする
+    """
+    if q_init is None:
+        q = np.array([0.0, -0.6, 0.0, 1.97], dtype=float)
+    else:
+        q = np.array(q_init, dtype=float)
+
+    limits = [
+        (-3.14, 3.14),
+        (-1.5, 1.5),
+        (-1.5, 1.4),
+        (-1.7, 1.97)
+    ]
+
+    # 目標方位へのベース旋回 (joint1)
+    q[0] = np.arctan2(target_pos[1], target_pos[0])
+
+    lam = 0.01
+    for _ in range(max_iter):
+        T = omx_fk(q)
+        cur_pos = T[:3, 3]
+        e_pos = target_pos - cur_pos
+
+        pos_err_norm = np.linalg.norm(e_pos)
+        if pos_err_norm < tol:
+            return True, q, pos_err_norm
+
+        # 位置合わせ最優先 (重み 1.0)、ピッチ下向きは緩やかな拘束 (重み 0.1)
+        cur_pitch = q[1] + q[2] + q[3]
+        target_pitch = 1.3
+        e_pitch = target_pitch - cur_pitch
+        e = np.hstack([e_pos, [0.08 * e_pitch]])
+
+        eps = 1e-6
+        J = np.zeros((4, 4))
+        for j in range(4):
+            q_step = q.copy()
+            q_step[j] += eps
+            T_step = omx_fk(q_step)
+            pos_step = T_step[:3, 3]
+            pitch_step = q_step[1] + q_step[2] + q_step[3]
+            f_step = np.hstack([pos_step, [0.08 * pitch_step]])
+            f_cur = np.hstack([cur_pos, [0.08 * cur_pitch]])
+            J[:, j] = (f_step - f_cur) / eps
+
+        JJt = J @ J.T + (lam**2) * np.eye(4)
+        dq = J.T @ np.linalg.solve(JJt, e)
+
+        q += 0.5 * dq
+        for j in range(4):
+            q[j] = np.clip(q[j], limits[j][0], limits[j][1])
+
+    final_err = np.linalg.norm(omx_fk(q)[:3, 3] - target_pos)
+    return (final_err < 0.01), q, final_err
+
+
+# ---------------------------------------------------------
+# ROS 2 ノード: マーカー認識 & アプローチ制御
+# ---------------------------------------------------------
+class QRApproachVerifier(Node):
+    def __init__(self, marker_size=None, height_offset=0.04, calib_file=None, marker_mode='auto', initial_joints=None):
+        super().__init__('qr_verification_approach')
+        self.height_offset = height_offset
+        self.marker_mode = marker_mode
+
+        if initial_joints is None:
+            self.home_position = [0.0, -0.6, 0.0, 1.97]
+        else:
+            self.home_position = list(initial_joints)
+
+        self.bridge = CvBridge()
+        self.color_k = None
+        self.color_d = None
+        self.latest_rgb_image = None
+        self.current_joint_positions = list(self.home_position)
+        self.joints_received = False
+
+        # キャリブレーション結果とメタデータ(marker_size)のロード
+        self.T_ee_cam, loaded_marker_size = self.load_calibration(calib_file)
+        
+        # コマンドラインで指定がない場合はキャリブレーション時のマーカーサイズを自動使用
+        if marker_size is not None and marker_size > 0:
+            self.marker_size = marker_size
+        elif loaded_marker_size is not None:
+            self.marker_size = loaded_marker_size
+        else:
+            self.marker_size = 0.05
+
+        self.tf_buffer = tf2_ros.Buffer()
+        self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
+
+        self.qr_detector = cv2.QRCodeDetector()
+        self.aruco_dict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_6X6_250)
+        if hasattr(cv2.aruco, 'DetectorParameters_create'):
+            self.aruco_params = cv2.aruco.DetectorParameters_create()
+        else:
+            self.aruco_params = cv2.aruco.DetectorParameters()
+
+        self.create_subscription(
+            CameraInfo,
+            '/camera/camera/color/camera_info',
+            self.color_info_cb,
+            10
+        )
+        self.create_subscription(
+            Image,
+            '/camera/camera/color/image_raw',
+            self.rgb_image_cb,
+            10
+        )
+        self.create_subscription(
+            JointState,
+            '/joint_states',
+            self.joint_state_cb,
+            10
+        )
+
+        self.traj_pub = self.create_publisher(
+            JointTrajectory,
+            '/arm_controller/joint_trajectory',
+            10
+        )
+
+        self.get_logger().info("==================================================")
+        self.get_logger().info(" QR/ArUco Approach Verification Node Started")
+        self.get_logger().info(f" - Marker size: {self.marker_size * 100:.2f} cm (from calibration data)")
+        self.get_logger().info(f" - Height offset above marker: {self.height_offset * 100:.1f} cm")
+        self.get_logger().info(f" - Initial Pose: {np.round(self.home_position, 3)}")
+        self.get_logger().info("==================================================")
+
+    def load_calibration(self, calib_path):
+        if calib_path is None:
+            script_dir = os.path.dirname(os.path.abspath(__file__))
+            candidates = [
+                os.path.join(script_dir, "calibration_result.json"),
+                os.path.join(script_dir, "calibration", "calibration_result.json"),
+                "/root/ros2_ws/workspace/calibration/calibration_result.json",
+                "calibration/calibration_result.json"
+            ]
+            for c in candidates:
+                if os.path.exists(c):
+                    calib_path = c
+                    break
+
+        if calib_path is None or not os.path.exists(calib_path):
+            self.get_logger().warn(f"Calibration file not found at {calib_path}. Using identity fallback.")
+            return np.eye(4), None
+
+        try:
+            with open(calib_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            T = np.array(data['result']['transform_matrix'])
+            marker_size = data.get('meta', {}).get('marker_size_m', None)
+            self.get_logger().info(f"Loaded calibration from {calib_path} (marker_size_m={marker_size})")
+            return T, marker_size
+        except Exception as e:
+            self.get_logger().error(f"Failed to load calibration file: {e}")
+            return np.eye(4), None
+
+    def color_info_cb(self, msg: CameraInfo):
+        if self.color_k is None:
+            self.color_k = np.array(msg.k).reshape(3, 3)
+            self.color_d = np.array(msg.d)
+            self.get_logger().info("Color Camera Intrinsics received.")
+
+    def rgb_image_cb(self, msg: Image):
+        try:
+            self.latest_rgb_image = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
+        except Exception as e:
+            self.get_logger().error(f"CvBridge RGB error: {e}")
+
+    def joint_state_cb(self, msg: JointState):
+        arm_names = ['joint1', 'joint2', 'joint3', 'joint4']
+        if set(arm_names).issubset(set(msg.name)):
+            for i, name in enumerate(arm_names):
+                idx = msg.name.index(name)
+                self.current_joint_positions[i] = msg.position[idx]
+            self.joints_received = True
+
+    def detect_marker(self, img):
+        if self.marker_mode in ['auto', 'qr']:
+            retval, decoded_info, points, _ = self.qr_detector.detectAndDecodeMulti(img)
+            if retval and points is not None and len(points) > 0:
+                pts = points[0].astype(np.float32)
+                if len(pts) == 4:
+                    return pts, 'QR', decoded_info[0] if decoded_info else ''
+
+        if self.marker_mode in ['auto', 'aruco']:
+            corners, ids, _ = cv2.aruco.detectMarkers(img, self.aruco_dict, parameters=self.aruco_params)
+            if ids is not None and len(corners) > 0:
+                pts = corners[0][0].astype(np.float32)
+                return pts, 'ArUco', f"ID: {ids[0][0]}"
+
+        return None, None, None
+
+    def estimate_marker_pose_cam(self, corners):
+        """
+        キャリブレーション時(calibrate_hand_eye.py)と完全に同一のPnP姿勢推定
+        """
+        s = self.marker_size / 2.0
+        obj_pts = np.array([
+            [-s,  s, 0.0],
+            [ s,  s, 0.0],
+            [ s, -s, 0.0],
+            [-s, -s, 0.0]
+        ], dtype=np.float32)
+
+        ret, rvec, tvec = cv2.solvePnP(
+            obj_pts,
+            corners,
+            self.color_k,
+            self.color_d,
+            flags=cv2.SOLVEPNP_IPPE_SQUARE
+        )
+        if not ret:
+            ret, rvec, tvec = cv2.solvePnP(obj_pts, corners, self.color_k, self.color_d)
+
+        R, _ = cv2.Rodrigues(rvec)
+        T_cam_marker = np.eye(4)
+        T_cam_marker[:3, :3] = R
+        T_cam_marker[:3, 3] = tvec.ravel()
+        return T_cam_marker, rvec, tvec
+
+    def get_world_to_ee_transform(self):
+        try:
+            trans_msg = self.tf_buffer.lookup_transform(
+                'world',
+                'end_effector_link',
+                rclpy.time.Time(),
+                timeout=rclpy.duration.Duration(seconds=0.1)
+            )
+            t = trans_msg.transform.translation
+            r = trans_msg.transform.rotation
+            qx, qy, qz, qw = r.x, r.y, r.z, r.w
+            R = np.array([
+                [1 - 2*(qy**2 + qz**2), 2*(qx*qy - qz*qw),     2*(qx*qz + qy*qw)],
+                [2*(qx*qy + qz*qw),     1 - 2*(qx**2 + qz**2), 2*(qy*qz - qx*qw)],
+                [2*(qx*qz - qy*qw),     2*(qy*qz + qx*qw),     1 - 2*(qx**2 + qy**2)]
+            ])
+            T_world_ee = np.eye(4)
+            T_world_ee[:3, :3] = R
+            T_world_ee[:3, 3] = [t.x, t.y, t.z]
+            return T_world_ee
+        except Exception:
+            return omx_fk(self.current_joint_positions)
+
+    def send_joint_trajectory(self, target_joints, duration_sec=4.0):
+        msg = JointTrajectory()
+        msg.joint_names = ['joint1', 'joint2', 'joint3', 'joint4']
+
+        point = JointTrajectoryPoint()
+        point.positions = [float(x) for x in target_joints]
+        point.time_from_start.sec = int(duration_sec)
+        point.time_from_start.nanosec = int((duration_sec - int(duration_sec)) * 1e9)
+
+        msg.points.append(point)
+        self.traj_pub.publish(msg)
+        self.get_logger().info(f"Published trajectory: joints={np.round(target_joints, 3)}, duration={duration_sec}s")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Verify Hand-Eye calibration by approaching a QR / ArUco marker")
+    parser.add_argument("--marker-size", type=float, default=None, help="Marker side length in meters (default: auto from calibration_result.json)")
+    parser.add_argument("--height-offset", type=float, default=0.08, help="Height offset above marker in meters (default: 0.08 = 8cm)")
+    parser.add_argument("--calib-file", type=str, default=None, help="Path to calibration_result.json")
+    parser.add_argument("--mode", type=str, default="auto", choices=["auto", "qr", "aruco"], help="Detection mode")
+    parser.add_argument("--joint2", type=float, default=-0.6, help="Initial joint2 angle in radians (default: -0.6)")
+    parser.add_argument("--joint3", type=float, default=0.0, help="Initial joint3 angle in radians (default: 0.0)")
+    parser.add_argument("--joint4", type=float, default=1.97, help="Initial joint4 angle in radians (default: 1.97)")
+    parser.add_argument("--no-initial-move", action="store_true", help="Do not move to initial pose automatically on startup")
+    parser.add_argument("--no-gui", action="store_true", help="Run without OpenCV GUI window")
+    args = parser.parse_args()
+
+    rclpy.init()
+
+    initial_joints = [0.0, args.joint2, args.joint3, args.joint4]
+
+    node = QRApproachVerifier(
+        marker_size=args.marker_size,
+        height_offset=args.height_offset,
+        calib_file=args.calib_file,
+        marker_mode=args.mode,
+        initial_joints=initial_joints
+    )
+
+    if not args.no_gui:
+        cv2.namedWindow("QR Verification View", cv2.WINDOW_NORMAL)
+        cv2.resizeWindow("QR Verification View", 800, 600)
+
+    print("\n" + "=" * 60)
+    print(" [操作方法]")
+    print(f" マーカーサイズ: {node.marker_size * 100:.2f} cm (キャリブレーションデータと一致)")
+    print(f" 初期姿勢: 見下ろし姿勢 {np.round(initial_joints, 3)}")
+    print(" 1. 起動後、自動で高い見下ろし姿勢へアームを移動させます。")
+    print(" 2. カメラ視野内に地面・机のQRコードまたはArUcoマーカーを置きます。")
+    print(" 3. [SPACE] キー を押すと、マーカー直上へアプローチを開始します。")
+    print(" 4. [H] キーで初期姿勢に戻ります。")
+    print(" 5. [Q] キーで終了します。")
+    print("=" * 60 + "\n")
+
+    initial_move_attempted = False
+    start_time = time.time()
+
+    try:
+        while rclpy.ok():
+            rclpy.spin_once(node, timeout_sec=0.05)
+
+            if not args.no_initial_move and not initial_move_attempted and node.joints_received:
+                if time.time() - start_time > 1.0:
+                    node.get_logger().info("Moving to initial high-overhead pose...")
+                    node.send_joint_trajectory(node.home_position, duration_sec=3.0)
+                    initial_move_attempted = True
+
+            if node.latest_rgb_image is None or node.color_k is None:
+                continue
+
+            vis_img = node.latest_rgb_image.copy()
+            corners, m_type, m_info = node.detect_marker(vis_img)
+
+            target_calculated = False
+            target_world_ee = None
+            sol_q = None
+
+            if corners is not None:
+                int_corners = np.int32(corners)
+                cv2.polylines(vis_img, [int_corners], True, (0, 255, 0), 2)
+                cv2.circle(vis_img, tuple(int_corners[0]), 5, (0, 0, 255), -1)
+
+                # キャリブレーションと完全に同一のパイプラインで姿勢推定
+                T_cam_marker, rvec, tvec = node.estimate_marker_pose_cam(corners)
+                p_cam_marker = T_cam_marker[:3, 3]
+
+                try:
+                    cv2.drawFrameAxes(vis_img, node.color_k, node.color_d, rvec, tvec, node.marker_size * 0.8)
+                except Exception:
+                    pass
+
+                # ワールド座標系でのマーカー位置計算:
+                # T_world_marker = T_world_ee * T_ee_cam * T_cam_marker
+                T_world_ee = node.get_world_to_ee_transform()
+                T_world_marker = T_world_ee @ node.T_ee_cam @ T_cam_marker
+                p_world_marker = T_world_marker[:3, 3]
+
+                # 目標手先位置: マーカー直上 (Z + height_offset)
+                target_world_ee = p_world_marker.copy()
+                target_world_ee[2] += node.height_offset
+
+                # 逆運動学の求解 (手先位置をミリ単位で合致)
+                ik_success, sol_q, ik_err = solve_omx_ik(
+                    target_world_ee,
+                    q_init=node.current_joint_positions
+                )
+                target_calculated = ik_success
+
+                cv2.putText(vis_img, f"Detected: {m_type} ({m_info}) [Calibrated Pipeline]", (20, 30),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 0), 2)
+                cv2.putText(vis_img, f"Marker Cam Pos: [{p_cam_marker[0]:.3f}, {p_cam_marker[1]:.3f}, {p_cam_marker[2]:.3f}] m",
+                            (20, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 0), 2)
+                cv2.putText(vis_img, f"Marker World Pos:  [{p_world_marker[0]:.3f}, {p_world_marker[1]:.3f}, {p_world_marker[2]:.3f}] m",
+                            (20, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 200, 0), 2)
+                cv2.putText(vis_img, f"Target Approach Pos: [{target_world_ee[0]:.3f}, {target_world_ee[1]:.3f}, {target_world_ee[2]:.3f}] m",
+                            (20, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 2)
+
+                if ik_success:
+                    cv2.putText(vis_img, f"IK Status: READY (err: {ik_err*1000:.1f}mm) - Press SPACE", (20, 150),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 0), 2)
+                else:
+                    cv2.putText(vis_img, f"IK Status: OUT OF REACH (err: {ik_err*100:.1f}cm)", (20, 150),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 0, 255), 2)
+
+            else:
+                cv2.putText(vis_img, "Searching for QR / ArUco marker...", (20, 30),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+
+            cv2.putText(vis_img, "[SPACE]: Approach Marker | [H]: Home Pose | [Q]: Quit",
+                        (20, vis_img.shape[0] - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 2)
+
+            if not args.no_gui:
+                cv2.imshow("QR Verification View", vis_img)
+                key = cv2.waitKey(10) & 0xFF
+            else:
+                key = 255
+
+            if key == 32:  # SPACE
+                if target_calculated and sol_q is not None:
+                    node.get_logger().info(f">>> Moving End-Effector to Target: {[round(float(x), 3) for x in target_world_ee]} m <<<")
+                    node.send_joint_trajectory(sol_q, duration_sec=4.0)
+                else:
+                    node.get_logger().warn("Cannot approach: Target not reachable or marker not detected.")
+
+            elif key == ord('h') or key == ord('H'):
+                node.get_logger().info("Returning to high overhead pose...")
+                node.send_joint_trajectory(node.home_position, duration_sec=3.0)
+
+            elif key == ord('q') or key == 27:
+                break
+
+    except KeyboardInterrupt:
+        pass
+    finally:
+        if not args.no_gui:
+            cv2.destroyAllWindows()
+        node.destroy_node()
+        rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()

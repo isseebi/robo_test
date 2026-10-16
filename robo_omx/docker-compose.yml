@@ -1,0 +1,26 @@
+services:
+  omx-dev:
+    image: robotis/open-manipulator:latest
+    container_name: open_manipulator_container
+    network_mode: host
+    ipc: host
+    privileged: true
+    environment:
+      - DISPLAY=${DISPLAY}
+      - QT_X11_NO_MITSHM=1
+      - ROS_DOMAIN_ID=30
+    volumes:
+      - /tmp/.X11-unix:/tmp/.X11-unix:rw
+      - /dev:/dev
+      - ./src:/root/ros2_ws/src
+      - .:/root/ros2_ws/workspace
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    command: /bin/bash
+    stdin_open: true
+    tty: true
